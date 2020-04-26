@@ -157,7 +157,9 @@ type UniformsOptions = {
 };
 
 type Props = {|
-  shader: ShaderIdentifier | ShaderDefinition,
+  composite?: boolean,
+  // TODO: made this optional, but really it's required if NOT composite... more reason for different types
+  shader?: ShaderIdentifier | ShaderDefinition,
   uniformsOptions: UniformsOptions,
   uniforms: Uniforms,
   ignoreUnusedUniforms?: Array<string> | boolean,
@@ -173,6 +175,7 @@ type Props = {|
 
 // not sure why, but we must define this for Flow to properly type check
 type DefaultProps = {
+  composite: boolean,
   uniformsOptions: UniformsOptions,
   uniforms: Uniforms,
   blendFunc: BlendFuncSrcDst,
@@ -358,7 +361,7 @@ const applyTextureOptions = (
 };
 
 const NodePropTypes = {
-  shader: PropTypes.object.isRequired,
+  shader: PropTypes.object,
   uniformsOptions: PropTypes.object,
   uniforms: PropTypes.object,
   ignoreUnusedUniforms: PropTypes.any,
@@ -392,6 +395,7 @@ const NodePropTypes = {
  *  <Node shader={shaders.helloGL} />
  */
 export default class Node extends Component<Props, *> {
+  isComposite: boolean = this.props.composite;
   drawProps: Props = this.props;
   context: SurfaceContext;
   framebuffer: ?Framebuffer;
@@ -402,6 +406,7 @@ export default class Node extends Component<Props, *> {
   uniformsBus: { [key: string]: Array<?Bus> } = {};
   dependencies: Array<Node | Bus> = []; // Node this instance depends on
   dependents: Array<Node | Surface> = []; // Node/Surface that depends on this instance
+  glChildren: Array<Node> = [];
 
   static propTypes = NodePropTypes;
 
@@ -415,7 +420,8 @@ export default class Node extends Component<Props, *> {
     },
     clear: {
       color: [0, 0, 0, 0]
-    }
+    },
+    composite: false,
   };
 
   static contextTypes = {
@@ -623,6 +629,7 @@ export default class Node extends Component<Props, *> {
     if (!this._needsRedraw) {
       this._needsRedraw = true;
       this.dependents.forEach(d => d.redraw());
+      this.glChildren.forEach(child => child.redraw());
     }
   };
 
@@ -657,6 +664,11 @@ export default class Node extends Component<Props, *> {
     delete this.backbuffer;
   }
 
+  _isInLayer(): boolean { 
+    const { glParent } = this.context;
+    return glParent.isComposite;
+  }
+
   _prepareGLObjects(gl: WebGLRenderingContext): void {
     const [width, height] = this.getGLSize();
     const { glParent, glSurface } = this.context;
@@ -664,6 +676,17 @@ export default class Node extends Component<Props, *> {
       // my parent IS the glSurface, should prevent from creating a FBO.
       // when a FBO is not created, _draw() happens on the final Canvas (null fbo)
       // NB we can just do this in WillMount because this context will not change.
+      invariant(
+        !this.drawProps.backbuffering,
+        "`backbuffering` is currently not supported for a Root Node. " +
+          "Try to wrap %s in a <LinearCopy> or <NearestCopy>.",
+        this.getGLName()
+      );
+    } else if (this._isInLayer()) { 
+      // parent is our custom composite element, so use it's framebuffer
+
+      // this is probably true for us too? idk, i don't use this feature and didn't
+      // test or support it in creating this hack :D
       invariant(
         !this.drawProps.backbuffering,
         "`backbuffering` is currently not supported for a Root Node. " +
@@ -691,8 +714,16 @@ export default class Node extends Component<Props, *> {
     this._needsRedraw = true;
   }
 
-  _addGLNodeChild(node: Node) {}
-  _removeGLNodeChild(node: Node) {}
+  _addGLNodeChild(node: Node) {
+    this.glChildren.push(node);
+    node._addDependent(this);
+  }
+  _removeGLNodeChild(node: Node) {
+    const index = this.glChildren.indexOf(node);
+    if (index > -1) {
+     this.glChildren.splice(index, 1);
+    }
+  }
 
   _addUniformBus(uniformBus: Bus, uniformName: string, index: number): void {
     const array =
@@ -738,6 +769,8 @@ export default class Node extends Component<Props, *> {
   _bind(): void {
     if (this.framebuffer) {
       this.framebuffer.bind();
+    } else if (this._isInLayer()) {
+      // let parent handle it
     } else {
       this.context.glSurface._bindRootNode();
     }
@@ -810,371 +843,394 @@ export default class Node extends Component<Props, *> {
 
     //~ PREPARE phase
 
-    if (!this.framebuffer) {
-      const { glSizable } = this.context;
-      const [width, height] = glSizable.getGLSize();
-      const [nw, nh] = this.getGLSize();
-      invariant(
-        nw === width && nh === height,
-        nodeName +
-          " is root but have overrided {width=%s,height=%s} which doesn't match Surface size {width=%s,height=%s}. " +
-          "Try to wrap your Node in a <NearestCopy> or <LinearCopy>",
-        nw,
-        nh,
-        width,
-        height
-      );
-    }
-
-    const shader = this._getShader(shaderProp);
-
-    this._needsRedraw = false; // FIXME what's the correct position of this line?
-
-    const { types } = shader;
     const glRedrawableDependencies: Array<Node | Bus> = [];
-    const pendingTextures: Array<*> = [];
-    let units = 0;
-    const usedUniforms = Object.keys(types.uniforms);
-    const providedUniforms = Object.keys(uniforms);
-    const { uniformsBus } = this;
-    for (let k in uniformsBus) {
-      if (!(k in uniforms)) {
-        providedUniforms.push(k);
-      }
-    }
-    const textureUnits: Map<WebGLTexture, number> = new Map();
-
-    const prepareTexture = (
-      initialObj: mixed,
-      uniformOptions: ?$Shape<TextureOptions>,
-      uniformKeyName: string
-    ) => {
-      let obj = initialObj,
-        dependency: ?(Node | Bus),
-        result: ?{
-          directTexture?: ?WebGLTexture,
-          directTextureSize?: ?[number, number],
-          glNode?: Node,
-          glNodePickBackbuffer?: boolean
-        };
-
-      if (typeof obj === "function") {
-        // texture uniform can be a function that resolves the object at draw time.
-        obj = (obj: AsyncMixed)(this.redraw);
+    // not a composite, so prepare to draw ourself
+    if (!this.props.composite) {
+      if (!this.framebuffer) {
+        const { glSizable } = this.context;
+        const [width, height] = glSizable.getGLSize();
+        const [nw, nh] = this.getGLSize();
+        invariant(
+          nw === width && nh === height,
+          nodeName +
+            " is root but have overrided {width=%s,height=%s} which doesn't match Surface size {width=%s,height=%s}. " +
+            "Try to wrap your Node in a <NearestCopy> or <LinearCopy>",
+          nw,
+          nh,
+          width,
+          height
+        );
       }
 
-      if (!obj) {
-        if (obj === undefined) {
-          console.warn(
-            `${nodeName}, uniform '${uniformKeyName}' is undefined.` +
-              "If you explicitely want to clear a texture, set it to null."
-          );
+      const shader = this._getShader(shaderProp);
+
+      this._needsRedraw = false; // FIXME what's the correct position of this line?
+
+      const { types } = shader;
+      const pendingTextures: Array<*> = [];
+      let units = 0;
+      const usedUniforms = Object.keys(types.uniforms);
+      const providedUniforms = Object.keys(uniforms);
+      const { uniformsBus } = this;
+      for (let k in uniformsBus) {
+        if (!(k in uniforms)) {
+          providedUniforms.push(k);
         }
-      } else if (isBackbuffer(obj)) {
-        // maybe it's backbuffer?
-        if (!this.drawProps.backbuffering) {
-          console.warn(
-            `${nodeName}, uniform ${uniformKeyName}: you must set \`backbuffering\` on Node when using Backbuffer`
-          );
+      }
+      const textureUnits: Map<WebGLTexture, number> = new Map();
+
+      const prepareTexture = (
+        initialObj: mixed,
+        uniformOptions: ?$Shape<TextureOptions>,
+        uniformKeyName: string
+      ) => {
+        let obj = initialObj,
+          dependency: ?(Node | Bus),
+          result: ?{
+            directTexture?: ?WebGLTexture,
+            directTextureSize?: ?[number, number],
+            glNode?: Node,
+            glNodePickBackbuffer?: boolean
+          };
+
+        if (typeof obj === "function") {
+          // texture uniform can be a function that resolves the object at draw time.
+          obj = (obj: AsyncMixed)(this.redraw);
         }
-        result = { glNode: this, glNodePickBackbuffer: true };
-      } else if (isBackbufferFrom(obj)) {
-        // backbuffer of another node/bus
-        invariant(
-          typeof obj === "object",
-          "invalid backbufferFromNode. Got: %s",
-          obj
-        );
-        let node = obj.node;
-        if (node instanceof Bus) {
-          node = node.getGLRenderableNode();
-          invariant(
-            node,
-            "backbufferFromNode(bus) but bus.getGLRenderableNode() is %s",
-            node
-          );
-        }
-        invariant(
-          node instanceof Node,
-          "invalid backbufferFromNode(obj): obj must be an instanceof Node or Bus. Got: %s",
-          obj
-        );
-        if (!node.drawProps.backbuffering) {
-          console.warn(
-            `${nodeName}, uniform ${uniformKeyName}: you must set \`backbuffering\` on the Node referenced in backbufferFrom(${node.getGLName()})`
-          );
-        }
-        result = { glNode: node, glNodePickBackbuffer: true };
-      } else if (obj instanceof Node) {
-        // maybe it's a Node?
-        dependency = obj;
-        result = { glNode: obj };
-      } else if (obj instanceof Bus) {
-        // maybe it's a Bus?
-        // to a node?
-        const node = obj.getGLRenderableNode();
-        if (node) {
-          dependency = node;
-          result = { glNode: node };
-        } else {
-          // to a DOM/native element? (like <canvas>, <video>, ...)
-          dependency = obj;
-          const renderable: ?Element = obj.getGLRenderableContent();
-          if (!renderable) {
+
+        if (!obj) {
+          if (obj === undefined) {
             console.warn(
-              `${nodeName}, uniform ${uniformKeyName}: child is not renderable. Got:`,
-              renderable
+              `${nodeName}, uniform '${uniformKeyName}' is undefined.` +
+                "If you explicitely want to clear a texture, set it to null."
             );
-            result = { directTexture: null };
-          } else {
-            obj = renderable;
           }
-        }
-      }
-
-      // In any remaining cases, we are asking texture loaders
-      // to concretely resolve the Texture.
-      if (!result && obj) {
-        const { loader, input } = glSurface._resolveTextureLoader(obj);
-        if (!loader) {
-          console.warn(
-            `${nodeName}, uniform ${uniformKeyName}: no loader found for value`,
-            input,
+        } else if (isBackbuffer(obj)) {
+          // maybe it's backbuffer?
+          if (!this.drawProps.backbuffering) {
+            console.warn(
+              `${nodeName}, uniform ${uniformKeyName}: you must set \`backbuffering\` on Node when using Backbuffer`
+            );
+          }
+          result = { glNode: this, glNodePickBackbuffer: true };
+        } else if (isBackbufferFrom(obj)) {
+          // backbuffer of another node/bus
+          invariant(
+            typeof obj === "object",
+            "invalid backbufferFromNode. Got: %s",
             obj
           );
-        } else {
-          const t = loader.get(input);
-          if (t) {
-            loader.update(input);
-            result = {
-              directTexture: t.texture,
-              directTextureSize: [t.width, t.height]
-            };
+          let node = obj.node;
+          if (node instanceof Bus) {
+            node = node.getGLRenderableNode();
+            invariant(
+              node,
+              "backbufferFromNode(bus) but bus.getGLRenderableNode() is %s",
+              node
+            );
+          }
+          invariant(
+            node instanceof Node,
+            "invalid backbufferFromNode(obj): obj must be an instanceof Node or Bus. Got: %s",
+            obj
+          );
+          if (!node.drawProps.backbuffering) {
+            console.warn(
+              `${nodeName}, uniform ${uniformKeyName}: you must set \`backbuffering\` on the Node referenced in backbufferFrom(${node.getGLName()})`
+            );
+          }
+          result = { glNode: node, glNodePickBackbuffer: true };
+        } else if (obj instanceof Node) {
+          // maybe it's a Node?
+          dependency = obj;
+          result = { glNode: obj };
+        } else if (obj instanceof Bus) {
+          // maybe it's a Bus?
+          // to a node?
+          const node = obj.getGLRenderableNode();
+          if (node) {
+            dependency = node;
+            result = { glNode: node };
           } else {
-            // otherwise, we will have to load it and postpone the rendering.
-            const p = loader.load(input);
-            pendingTextures.push(p);
+            // to a DOM/native element? (like <canvas>, <video>, ...)
+            dependency = obj;
+            const renderable: ?Element = obj.getGLRenderableContent();
+            if (!renderable) {
+              console.warn(
+                `${nodeName}, uniform ${uniformKeyName}: child is not renderable. Got:`,
+                renderable
+              );
+              result = { directTexture: null };
+            } else {
+              obj = renderable;
+            }
           }
         }
-      }
 
-      // we also accumulate a dep, that will be used to build the gl graph.
-      if (dependency) glRedrawableDependencies.push(dependency);
-
-      const textureOptions = result ? uniformOptions : null;
-      const getMetaInfo = () => ({
-        initialObj,
-        obj,
-        dependency,
-        textureOptions
-      });
-      const getSize = (): ?[number, number] => {
-        const fallback = [2, 2];
-        return result
-          ? "directTextureSize" in result
-            ? result.directTextureSize
-            : result.glNode
-            ? result.glNode.getGLSize()
-            : fallback
-          : fallback;
-      };
-      const prepare = () => {
-        const texture: WebGLTexture =
-          (result &&
-            (result.directTexture ||
-              (result.glNode &&
-                (result.glNodePickBackbuffer
-                  ? result.glNode.getGLBackbufferOutput()
-                  : result.glNode.getGLOutput())))) ||
-          glSurface.getEmptyTexture();
-        if (textureUnits.has(texture)) {
-          // FIXME different uniform options on a same texture is not supported
-          return textureUnits.get(texture);
+        // In any remaining cases, we are asking texture loaders
+        // to concretely resolve the Texture.
+        if (!result && obj) {
+          const { loader, input } = glSurface._resolveTextureLoader(obj);
+          if (!loader) {
+            console.warn(
+              `${nodeName}, uniform ${uniformKeyName}: no loader found for value`,
+              input,
+              obj
+            );
+          } else {
+            const t = loader.get(input);
+            if (t) {
+              loader.update(input);
+              result = {
+                directTexture: t.texture,
+                directTextureSize: [t.width, t.height]
+              };
+            } else {
+              // otherwise, we will have to load it and postpone the rendering.
+              const p = loader.load(input);
+              pendingTextures.push(p);
+            }
+          }
         }
-        const value = units++;
-        gl.activeTexture(gl.TEXTURE0 + value);
-        gl.bindTexture(gl.TEXTURE_2D, texture);
-        applyTextureOptions(gl, textureOptions);
-        textureUnits.set(texture, value);
-        return value;
-      };
-      return {
-        getMetaInfo,
-        getSize,
-        prepare
-      };
-    };
 
-    const prepareUniform = key => {
-      const uniformType = types.uniforms[key];
-      if (!uniformType) {
-        const ignoredWarn =
-          ignoreUnusedUniforms === true ||
-          (ignoreUnusedUniforms instanceof Array &&
-            ignoreUnusedUniforms.includes(key));
-        if (!ignoredWarn) {
-          console.warn(
-            `${nodeName} uniform '${key}' is not declared, nor used, in your shader code`
-          );
-        }
-        return { key, value: undefined };
-      }
-      const uniformValue = uniforms[key];
-      usedUniforms.splice(usedUniforms.indexOf(key), 1);
+        // we also accumulate a dep, that will be used to build the gl graph.
+        if (dependency) glRedrawableDependencies.push(dependency);
 
-      if (uniformType === "sampler2D") {
-        const uniformBus = uniformsBus[key];
-        const { getMetaInfo, prepare } = prepareTexture(
-          (uniformBus && uniformBus[0]) || uniformValue,
-          uniformsOptions[key],
-          key
-        );
+        const textureOptions = result ? uniformOptions : null;
+        const getMetaInfo = () => ({
+          initialObj,
+          obj,
+          dependency,
+          textureOptions
+        });
+        const getSize = (): ?[number, number] => {
+          const fallback = [2, 2];
+          return result
+            ? "directTextureSize" in result
+              ? result.directTextureSize
+              : result.glNode
+              ? result.glNode.getGLSize()
+              : fallback
+            : fallback;
+        };
+        const prepare = () => {
+          const texture: WebGLTexture =
+            (result &&
+              (result.directTexture ||
+                (result.glNode &&
+                  (result.glNodePickBackbuffer
+                    ? result.glNode.getGLBackbufferOutput()
+                    : result.glNode.getGLOutput())))) ||
+            glSurface.getEmptyTexture();
+          if (textureUnits.has(texture)) {
+            // FIXME different uniform options on a same texture is not supported
+            return textureUnits.get(texture);
+          }
+          const value = units++;
+          gl.activeTexture(gl.TEXTURE0 + value);
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          applyTextureOptions(gl, textureOptions);
+          textureUnits.set(texture, value);
+          return value;
+        };
         return {
-          key,
-          type: uniformType,
           getMetaInfo,
+          getSize,
           prepare
         };
-      } else if (uniformValue === Uniform.Resolution) {
-        return {
-          key,
-          type: uniformType,
-          value: this.getGLSize()
-        };
-      } else if (isTextureSizeGetter(uniformValue)) {
-        invariant(
-          uniformValue && typeof uniformValue === "object",
-          "unexpected textureSize object. Got: %s",
-          uniformValue
-        );
-        const { getSize } = prepareTexture(uniformValue.obj, null, key);
-        const size = getSize();
-        if (!size) {
-          console.warn(
-            `${nodeName}, uniform ${key}: texture size is undetermined`
-          );
+      };
+
+      const prepareUniform = key => {
+        const uniformType = types.uniforms[key];
+        if (!uniformType) {
+          const ignoredWarn =
+            ignoreUnusedUniforms === true ||
+            (ignoreUnusedUniforms instanceof Array &&
+              ignoreUnusedUniforms.includes(key));
+          if (!ignoredWarn) {
+            console.warn(
+              `${nodeName} uniform '${key}' is not declared, nor used, in your shader code`
+            );
+          }
+          return { key, value: undefined };
         }
-        const value = uniformValue.ratio
-          ? size
-            ? size[0] / size[1]
-            : 1
-          : size || [0, 0];
-        return {
-          key,
-          type: uniformType,
-          value
-        };
-      } else if (Array.isArray(uniformType) && uniformType[0] === "sampler2D") {
-        let values;
-        const uniformBus = uniformsBus[key];
-        const v = mergeArrays(
-          Array.isArray(uniformValue) ? uniformValue : [],
-          Array.isArray(uniformBus) ? uniformBus : []
-        );
-        if (!v.length) {
-          console.warn(
-            `${nodeName}, uniform '${key}' should be an array of textures.`
+        const uniformValue = uniforms[key];
+        usedUniforms.splice(usedUniforms.indexOf(key), 1);
+
+        if (uniformType === "sampler2D") {
+          const uniformBus = uniformsBus[key];
+          const { getMetaInfo, prepare } = prepareTexture(
+            (uniformBus && uniformBus[0]) || uniformValue,
+            uniformsOptions[key],
+            key
           );
-          values = uniformType.map(() => null);
-        } else if (v.length !== uniformType.length) {
-          console.warn(
-            `${nodeName}, uniform '${key}' should be an array of exactly ${uniformType.length} textures (not ${v.length}).`
+          return {
+            key,
+            type: uniformType,
+            getMetaInfo,
+            prepare
+          };
+        } else if (uniformValue === Uniform.Resolution) {
+          return {
+            key,
+            type: uniformType,
+            value: this.getGLSize()
+          };
+        } else if (isTextureSizeGetter(uniformValue)) {
+          invariant(
+            uniformValue && typeof uniformValue === "object",
+            "unexpected textureSize object. Got: %s",
+            uniformValue
           );
-          values = uniformType.map(() => null);
+          const { getSize } = prepareTexture(uniformValue.obj, null, key);
+          const size = getSize();
+          if (!size) {
+            console.warn(
+              `${nodeName}, uniform ${key}: texture size is undetermined`
+            );
+          }
+          const value = uniformValue.ratio
+            ? size
+              ? size[0] / size[1]
+              : 1
+            : size || [0, 0];
+          return {
+            key,
+            type: uniformType,
+            value
+          };
+        } else if (Array.isArray(uniformType) && uniformType[0] === "sampler2D") {
+          let values;
+          const uniformBus = uniformsBus[key];
+          const v = mergeArrays(
+            Array.isArray(uniformValue) ? uniformValue : [],
+            Array.isArray(uniformBus) ? uniformBus : []
+          );
+          if (!v.length) {
+            console.warn(
+              `${nodeName}, uniform '${key}' should be an array of textures.`
+            );
+            values = uniformType.map(() => null);
+          } else if (v.length !== uniformType.length) {
+            console.warn(
+              `${nodeName}, uniform '${key}' should be an array of exactly ${uniformType.length} textures (not ${v.length}).`
+            );
+            values = uniformType.map(() => null);
+          } else {
+            values = v;
+          }
+
+          const uniformOptions = uniformsOptions[key]; // TODO support array of options as well
+          const all = values.map((value, i) =>
+            prepareTexture(value, uniformOptions, key + "[" + i + "]")
+          );
+
+          return {
+            key,
+            type: uniformType,
+            getMetaInfo: () =>
+              all.reduce((acc, o) => acc.concat(o.getMetaInfo()), []),
+            prepare: () => all.map(o => o.prepare())
+          };
         } else {
-          values = v;
+          if (uniformValue === undefined) {
+            console.warn(`${nodeName}, uniform '${key}' is undefined.`);
+          }
+          return {
+            key,
+            type: uniformType,
+            value: uniformValue
+          };
         }
+      };
+      const preparedUniforms = providedUniforms.map(prepareUniform);
 
-        const uniformOptions = uniformsOptions[key]; // TODO support array of options as well
-        const all = values.map((value, i) =>
-          prepareTexture(value, uniformOptions, key + "[" + i + "]")
+      if (usedUniforms.length !== 0) {
+        console.warn(
+          nodeName +
+            ": Missing uniforms: " +
+            usedUniforms.map(u => `'${u}'`).join(", ") +
+            "\n" +
+            "all uniforms must be provided " +
+            "because implementations might share and reuse a Shader Program"
         );
-
-        return {
-          key,
-          type: uniformType,
-          getMetaInfo: () =>
-            all.reduce((acc, o) => acc.concat(o.getMetaInfo()), []),
-          prepare: () => all.map(o => o.prepare())
-        };
-      } else {
-        if (uniformValue === undefined) {
-          console.warn(`${nodeName}, uniform '${key}' is undefined.`);
-        }
-        return {
-          key,
-          type: uniformType,
-          value: uniformValue
-        };
       }
-    };
-    const preparedUniforms = providedUniforms.map(prepareUniform);
 
-    if (usedUniforms.length !== 0) {
-      console.warn(
-        nodeName +
-          ": Missing uniforms: " +
-          usedUniforms.map(u => `'${u}'`).join(", ") +
-          "\n" +
-          "all uniforms must be provided " +
-          "because implementations might share and reuse a Shader Program"
+      // if some textures are not ready, we freeze the rendering so it doesn't blink
+      if (pendingTextures.length > 0) {
+        Promise.all(pendingTextures).then(this.redraw);
+        // ^ FIXME "cancel" this promise if we ever come back in _draw()
+        visitors.forEach(v => v.onNodeDrawSkipped(this));
+        return;
+      }
+
+      //~ the draw will happen, there is no more interruption cases.
+      visitors.forEach(v => v.onNodeDrawStart(this));
+
+      // we aren't a composite, so draw deps
+      const [additions, deletions] = this._syncDependencies(
+        glRedrawableDependencies
       );
-    }
+      visitors.forEach(v => v.onNodeSyncDeps(this, additions, deletions));
 
-    // if some textures are not ready, we freeze the rendering so it doesn't blink
-    if (pendingTextures.length > 0) {
-      Promise.all(pendingTextures).then(this.redraw);
-      // ^ FIXME "cancel" this promise if we ever come back in _draw()
-      visitors.forEach(v => v.onNodeDrawSkipped(this));
-      return;
-    }
-
-    //~ the draw will happen, there is no more interruption cases.
-    visitors.forEach(v => v.onNodeDrawStart(this));
-
-    const [additions, deletions] = this._syncDependencies(
-      glRedrawableDependencies
-    );
-    visitors.forEach(v => v.onNodeSyncDeps(this, additions, deletions));
-
-    if (backbuffering) {
-      // swap framebuffer and backbuffer
-      const { backbuffer, framebuffer } = this;
-      this.backbuffer = framebuffer;
-      if (backbuffer) {
-        this.framebuffer = backbuffer;
+      if (backbuffering) {
+        // swap framebuffer and backbuffer
+        const { backbuffer, framebuffer } = this;
+        this.backbuffer = framebuffer;
+        if (backbuffer) {
+          this.framebuffer = backbuffer;
+        }
       }
-    }
 
-    //~ DRAW dependencies step
-    const drawDep = d => d._draw();
-    this.dependencies.forEach(drawDep);
+      //~ DRAW dependencies step
+      const drawDep = d => d._draw();
+      this.dependencies.forEach(drawDep);
 
-    //~ DRAW this node step
+      //~ DRAW this node step
 
-    visitors.forEach(v => v.onNodeDraw(this, preparedUniforms));
+      visitors.forEach(v => v.onNodeDraw(this, preparedUniforms));
 
-    shader.bind();
-    this._bind();
-    preparedUniforms.forEach(obj => {
-      const value = obj.prepare ? obj.prepare() : obj.value;
-      if (value !== undefined) {
-        shader.uniforms[obj.key] = value;
+      this._bind();
+      shader.bind();
+      preparedUniforms.forEach(obj => {
+        const value = obj.prepare ? obj.prepare() : obj.value;
+        if (value !== undefined) {
+          shader.uniforms[obj.key] = value;
+        }
+      });
+
+      if (blendFunc) {
+        const src = mapBlendFunc(gl, blendFunc.src);
+        const dst = mapBlendFunc(gl, blendFunc.dst);
+        if (src && dst) gl.blendFunc(src, dst);
       }
-    });
+  
+      // do not clear the framebuffer if we are inside a layer!
+      if (clear && !this._isInLayer()) {
+        gl.clearColor(...clear.color);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+  
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    } else {
+      this._needsRedraw = false; // allow children to request new redraws
+      this._bind();
 
-    if (blendFunc) {
-      const src = mapBlendFunc(gl, blendFunc.src);
-      const dst = mapBlendFunc(gl, blendFunc.dst);
-      if (src && dst) gl.blendFunc(src, dst);
+      if (blendFunc) {
+        const src = mapBlendFunc(gl, blendFunc.src);
+        const dst = mapBlendFunc(gl, blendFunc.dst);
+        if (src && dst) gl.blendFunc(src, dst);
+      }
+  
+      if (clear && !this._isInLayer()) {
+        gl.clearColor(...clear.color);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+
+      this.glChildren.forEach(child => {
+        child._draw()
+      });
     }
-
-    if (clear) {
-      gl.clearColor(...clear.color);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-    }
-
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     if (onDraw) onDraw();
 
